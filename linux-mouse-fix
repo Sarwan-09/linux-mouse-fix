@@ -1,0 +1,871 @@
+#!/usr/bin/env python3
+"""Mac Mouse Fix-style mouse features for GNOME on Wayland.
+
+Runs as root: grabs the mouse exclusively and forwards its events through a virtual
+mouse, adding on the way:
+
+  * smooth, accelerated scrolling: each wheel notch becomes a short glide of
+    two-finger scrolling on a virtual touchpad, which every app renders smoothly
+    (Mac Mouse Fix calls this trackpad simulation);
+  * per-button click, double click, hold, click-and-drag and click-and-scroll
+    actions;
+  * drags that drive a virtual touchpad, so GNOME's workspace/overview swipe
+    (three fingers) and scroll/back-forward swipe (two fingers) follow the mouse.
+
+Settings live in a TOML file (--config) that is re-read whenever it changes, so the
+settings app can edit it without a restart. enabled = false releases the mouse.
+"""
+import argparse
+import copy
+import logging
+import math
+import os
+import select
+import time
+import tomllib
+
+import evdev
+from evdev import ecodes as e
+
+NAME_PREFIX = "linux-mouse-fix"
+CLICK_SLOP = 12          # movement (mouse counts) still treated as a click
+DOUBLE_CLICK_WINDOW = 0.3  # s from the first release to the second press
+HOLD_TIME = 0.45         # s held still before the hold action fires
+
+DEFAULTS = {
+    "enabled": True,
+    "scroll": {"smooth": "high", "speed": "medium", "acceleration": True, "reverse": False},
+    "drag": {"scale": 1.5, "invert": False},
+    "buttons": {
+        "middle": {"click": "middle-click", "hold": "show-desktop",
+                   "drag": "spaces", "scroll": "app-switcher"},
+        "front": {"click": "middle-click", "double-click": "overview",
+                  "drag": "spaces", "scroll": "zoom"},
+        "back": {"click": "back", "drag": "navigate", "scroll": "desktop-and-apps"},
+    },
+}
+
+BUTTONS = {"middle": e.BTN_MIDDLE, "back": e.BTN_SIDE, "front": e.BTN_EXTRA,
+           "button6": e.BTN_FORWARD, "button7": e.BTN_BACK, "button8": e.BTN_TASK}
+CLICKS = {"middle-click": e.BTN_MIDDLE, "primary-click": e.BTN_LEFT,
+          "secondary-click": e.BTN_RIGHT, "back": e.BTN_SIDE, "forward": e.BTN_EXTRA}
+SHORTCUTS = {"overview": "super", "app-grid": "super+a", "show-desktop": "super+d",
+             "workspace-left": "super+pageup", "workspace-right": "super+pagedown"}
+DRAG_EFFECTS = ("none", "spaces", "navigate")
+SCROLL_EFFECTS = ("none", "zoom", "app-switcher", "spaces", "desktop-and-apps",
+                  "precise", "swift")
+KEY_ALIASES = {"super": "LEFTMETA", "ctrl": "LEFTCTRL", "control": "LEFTCTRL",
+               "alt": "LEFTALT", "shift": "LEFTSHIFT", "esc": "ESC", "del": "DELETE"}
+
+log = logging.getLogger(NAME_PREFIX)
+
+
+def merge(base, override):
+    out = copy.deepcopy(base)
+    for key, value in override.items():
+        if isinstance(value, dict) and isinstance(out.get(key), dict):
+            out[key] = merge(out[key], value)
+        else:
+            out[key] = value
+    return out
+
+
+def parse_keys(spec):
+    """'ctrl+shift+t' -> [KEY_LEFTCTRL, KEY_LEFTSHIFT, KEY_T]"""
+    codes = []
+    for name in spec.lower().split("+"):
+        name = KEY_ALIASES.get(name.strip(), name.strip()).upper()
+        if f"KEY_{name}" not in e.ecodes:
+            raise ValueError(f"unknown key {name!r} in {spec!r}")
+        codes.append(e.ecodes[f"KEY_{name}"])
+    return codes
+
+
+def press_keys(kbd, keys):
+    """Press the keys in order, then release them in reverse."""
+    for code, value in [(k, 1) for k in keys] + [(k, 0) for k in reversed(keys)]:
+        kbd.write(e.EV_KEY, code, value)
+        kbd.syn()
+        time.sleep(0.01)
+
+
+def make_action(spec, kbd, mouse):
+    """An action name, mouse click or key combo -> callable (None for 'none')."""
+    if spec in (None, "none"):
+        return None
+    if spec in CLICKS:
+        return native_click(mouse, CLICKS[spec])
+    keys = parse_keys(SHORTCUTS.get(spec, spec))
+    return lambda: press_keys(kbd, keys)
+
+
+class SmoothScroller:
+    """Turns wheel notches into accelerated, eased streams of wheel movement."""
+
+    FRAME = 1 / 120
+    TAU = {"regular": 0.06, "high": 0.13}   # s; time constant of the ease-out
+    SPEED = {"low": 0.7, "medium": 1.0, "high": 1.5}
+    STREAK_GAP = 0.15                       # s between notches that count as a fast spin
+
+    def __init__(self, emit, smooth="high", speed="medium", acceleration=True,
+                 clock=time.monotonic, on_stop=None):
+        self.emit = emit  # emit(v120): one frame of vertical wheel movement
+        self.on_stop = on_stop
+        self.tau = self.TAU.get(smooth)  # None = no smoothing
+        self.speed = self.SPEED[speed]
+        self.acceleration = acceleration
+        self.clock = clock
+        self.remaining = 0.0
+        self.carry = 0.0
+        self.streak = 0.0       # notches spun in quick succession
+        self.direction = 0
+        self.last_notch = 0.0
+        self.last_frame = 0.0
+
+    def stop(self):
+        self.remaining = 0.0
+        if self.on_stop:
+            self.on_stop()
+
+    def wheel(self, v120, factor=None):
+        now = self.clock()
+        direction = 1 if v120 > 0 else -1
+        if direction != self.direction:
+            self.remaining = 0.0  # reversing stops the glide at once
+            self.streak = 0.0
+        elif now - self.last_notch < self.STREAK_GAP:
+            self.streak = min(self.streak + abs(v120) / 120, 10)
+        else:
+            self.streak = 0.0
+        self.direction = direction
+        self.last_notch = now
+        if factor is None:
+            factor = self.speed * (1 + 0.3 * self.streak if self.acceleration else 1)
+        if self.tau is None:
+            self._out(v120 * factor)
+            return
+        if abs(self.remaining) < 0.5:
+            self.last_frame = now
+        self.remaining += v120 * factor
+
+    def timeout(self):
+        if self.tau is None or abs(self.remaining) < 0.5:
+            return None
+        return max(0.0, self.last_frame + self.FRAME - self.clock())
+
+    def tick(self):
+        if self.timeout() != 0.0:
+            return
+        now = self.clock()
+        portion = self.remaining * (1 - math.exp(-(now - self.last_frame) / self.tau))
+        if abs(self.remaining - portion) < 1:
+            portion = self.remaining
+        self.remaining -= portion
+        self.last_frame = now
+        self._out(portion)
+
+    def _out(self, amount):
+        self.carry += amount
+        whole = int(self.carry)
+        self.carry -= whole
+        if whole:
+            self.emit(whole)
+
+
+def hires_emitter(mouse):
+    """emit(v120) for a virtual mouse, also sending legacy REL_WHEEL every 120 units."""
+    acc = 0
+
+    def emit(v120):
+        nonlocal acc
+        mouse.write(e.EV_REL, e.REL_WHEEL_HI_RES, v120)
+        acc += v120
+        while abs(acc) >= 120:
+            step = 1 if acc > 0 else -1
+            mouse.write(e.EV_REL, e.REL_WHEEL, step)
+            acc -= step * 120
+        mouse.syn()
+    return emit
+
+
+class VirtualTouchpad:
+    RES = 40                     # units per mm
+    WIDTH, HEIGHT = 12000, 8000  # 300 x 200 mm, room for long drags
+
+    def __init__(self, name="touchpad"):
+        axis = lambda size: evdev.AbsInfo(0, 0, size, 0, 0, self.RES)
+        caps = {
+            e.EV_KEY: [e.BTN_LEFT, e.BTN_TOUCH, e.BTN_TOOL_FINGER,
+                       e.BTN_TOOL_DOUBLETAP, e.BTN_TOOL_TRIPLETAP],
+            e.EV_ABS: [
+                (e.ABS_X, axis(self.WIDTH)),
+                (e.ABS_Y, axis(self.HEIGHT)),
+                (e.ABS_MT_SLOT, evdev.AbsInfo(0, 0, 2, 0, 0, 0)),
+                (e.ABS_MT_TRACKING_ID, evdev.AbsInfo(0, 0, 65535, 0, 0, 0)),
+                (e.ABS_MT_POSITION_X, axis(self.WIDTH)),
+                (e.ABS_MT_POSITION_Y, axis(self.HEIGHT)),
+            ],
+        }
+        self.dev = evdev.UInput(caps, name=f"{NAME_PREFIX} {name}",
+                                input_props=[e.INPUT_PROP_POINTER])
+        self.next_id = 0
+
+
+class TouchpadScroll:
+    """Two-finger scrolling on its own virtual touchpad, fed by the SmoothScroller.
+
+    Fingers go down on the first notch, move at a real touchpad's frame rate and
+    lift once the wheel has been idle for a moment.
+    """
+
+    NOTCH = 100        # touchpad units (2.5 mm) per wheel notch at medium speed
+    SPACING = 500
+    FRAME = 0.008      # s between frames; faster looks like a "touch jump" to libinput
+    MAX_STEP = 160     # units per frame
+    LIFT_DELAY = 0.3   # s of wheel idle before the fingers lift
+    TAP_GUARD = 0.25   # s; a shorter touch could count as a two-finger tap (right click)
+    LIMIT = 3000       # re-place the fingers before they run off the pad
+
+    def __init__(self, touchpad, reverse=False, clock=time.monotonic):
+        self.tp = touchpad
+        self.pad = touchpad.dev
+        # With matching natural-scroll settings for mouse and touchpad, wheel up (+)
+        # matches the fingers moving up (-y).
+        self.sign = 1 if reverse else -1
+        self.clock = clock
+        self.down = False
+        self.pending = 0.0
+        self.last_frame = 0.0
+
+    def emit(self, v120):
+        self.pending += v120 / 120 * self.NOTCH * self.sign
+
+    def stop(self):
+        self.pending = 0.0
+        if self.down:
+            self._lift()
+
+    def timeout(self):
+        now = self.clock()
+        if abs(self.pending) >= 1:
+            return 0.0 if not self.down else max(0.0, self.last_frame + self.FRAME - now)
+        if self.down:
+            return max(0.0, max(self.last_frame + self.LIFT_DELAY,
+                                self.down_since + self.TAP_GUARD) - now)
+        return None
+
+    def tick(self):
+        if self.timeout() != 0.0:
+            return
+        if abs(self.pending) < 1:
+            self._lift()
+        elif not self.down:
+            self._place()  # movement starts on the next frame
+        elif abs(self.y) > self.LIMIT and self.clock() - self.down_since >= self.TAP_GUARD:
+            self._lift()
+        else:
+            step = max(-self.MAX_STEP, min(self.MAX_STEP, self.pending))
+            self.pending -= step
+            self.y += step
+            self._write(self.y)
+            self.pad.syn()
+            self.last_frame = self.clock()
+
+    def _write(self, y, tracking=False):
+        cy = self.tp.HEIGHT // 2 + round(y)
+        cx = self.tp.WIDTH // 2
+        for i in range(2):
+            self.pad.write(e.EV_ABS, e.ABS_MT_SLOT, i)
+            if tracking:
+                self.pad.write(e.EV_ABS, e.ABS_MT_TRACKING_ID, self.tp.next_id + i)
+            self.pad.write(e.EV_ABS, e.ABS_MT_POSITION_X, cx + (i * 2 - 1) * self.SPACING // 2)
+            self.pad.write(e.EV_ABS, e.ABS_MT_POSITION_Y, cy)
+        self.pad.write(e.EV_ABS, e.ABS_X, cx)
+        self.pad.write(e.EV_ABS, e.ABS_Y, cy)
+
+    def _place(self):
+        self.y = 0.0
+        self._write(0, tracking=True)
+        self.tp.next_id = (self.tp.next_id + 2) % 60000
+        self.pad.write(e.EV_KEY, e.BTN_TOUCH, 1)
+        self.pad.write(e.EV_KEY, e.BTN_TOOL_DOUBLETAP, 1)
+        self.pad.syn()
+        self.down = True
+        self.down_since = self.last_frame = self.clock()
+
+    def _lift(self):
+        for i in range(2):
+            self.pad.write(e.EV_ABS, e.ABS_MT_SLOT, i)
+            self.pad.write(e.EV_ABS, e.ABS_MT_TRACKING_ID, -1)
+        self.pad.write(e.EV_KEY, e.BTN_TOUCH, 0)
+        self.pad.write(e.EV_KEY, e.BTN_TOOL_DOUBLETAP, 0)
+        self.pad.syn()
+        self.down = False
+
+
+class TouchpadDrag:
+    """Fakes a two- or three-finger touchpad swipe that follows the mouse."""
+
+    SPACING = 500             # 12.5 mm between fingers
+    TAP_GUARD = 0.25          # s; hold short, still swipes past libinput's tap timeout
+    # libinput discards touches that move too far too fast as "kernel bug: touch jump",
+    # so send frames at a real touchpad's pace and in bounded steps.
+    FRAME_INTERVAL = 0.008    # s
+    MAX_STEP = 120            # units (3 mm) per axis per frame
+    TOOLS = {2: e.BTN_TOOL_DOUBLETAP, 3: e.BTN_TOOL_TRIPLETAP}
+
+    def __init__(self, touchpad, fingers, sx, sy):
+        self.tp = touchpad
+        self.pad = touchpad.dev
+        self.fingers = fingers
+        self.sx, self.sy = sx, sy  # touchpad units per mouse count, signed
+        margin = 200
+        self.max_x = touchpad.WIDTH // 2 - (fingers - 1) * self.SPACING - margin
+        self.max_y = touchpad.HEIGHT // 2 - margin
+
+    def _write_fingers(self, tracking=False):
+        cx = self.tp.WIDTH // 2 + round(self.x)
+        cy = self.tp.HEIGHT // 2 + round(self.y)
+        for i in range(self.fingers):
+            self.pad.write(e.EV_ABS, e.ABS_MT_SLOT, i)
+            if tracking:
+                self.pad.write(e.EV_ABS, e.ABS_MT_TRACKING_ID, self.tp.next_id + i)
+            self.pad.write(e.EV_ABS, e.ABS_MT_POSITION_X,
+                           cx + round((i - (self.fingers - 1) / 2) * self.SPACING))
+            self.pad.write(e.EV_ABS, e.ABS_MT_POSITION_Y, cy)
+        self.pad.write(e.EV_ABS, e.ABS_X, cx)
+        self.pad.write(e.EV_ABS, e.ABS_Y, cy)
+
+    def begin(self):
+        self.x = self.y = 0.0
+        self.pending_x = self.pending_y = 0.0
+        self.started = self.last_frame = time.monotonic()
+        self.moved = 0.0
+        self._write_fingers(tracking=True)
+        self.tp.next_id = (self.tp.next_id + self.fingers) % 60000
+        self.pad.write(e.EV_KEY, e.BTN_TOUCH, 1)
+        self.pad.write(e.EV_KEY, self.TOOLS[self.fingers], 1)
+        self.pad.syn()
+
+    def move(self, dx, dy):
+        self.pending_x += dx * self.sx
+        self.pending_y += dy * self.sy
+
+    def frame(self):
+        now = time.monotonic()
+        if now - self.last_frame < self.FRAME_INTERVAL:
+            return
+        step = lambda v: max(-self.MAX_STEP, min(self.MAX_STEP, v))
+        sx, sy = step(self.pending_x), step(self.pending_y)
+        self.pending_x -= sx
+        self.pending_y -= sy
+        x = max(-self.max_x, min(self.max_x, self.x + sx))
+        y = max(-self.max_y, min(self.max_y, self.y + sy))
+        if round(x) == round(self.x) and round(y) == round(self.y):
+            return
+        self.moved += abs(x - self.x) + abs(y - self.y)
+        self.x, self.y = x, y
+        self.last_frame = now
+        self._write_fingers()
+        self.pad.syn()
+
+    def end(self):
+        # Play out movement still waiting for a frame, so a flick keeps its speed.
+        for _ in range(10):
+            if abs(self.pending_x) < 1 and abs(self.pending_y) < 1:
+                break
+            time.sleep(self.FRAME_INTERVAL)
+            self.frame()
+        # A short, nearly still multi-finger touch would be a tap (= a click).
+        if self.moved < 3 * self.tp.RES:
+            time.sleep(max(0.0, self.TAP_GUARD - (time.monotonic() - self.started)))
+        for i in range(self.fingers):
+            self.pad.write(e.EV_ABS, e.ABS_MT_SLOT, i)
+            self.pad.write(e.EV_ABS, e.ABS_MT_TRACKING_ID, -1)
+        self.pad.write(e.EV_KEY, e.BTN_TOUCH, 0)
+        self.pad.write(e.EV_KEY, self.TOOLS[self.fingers], 0)
+        self.pad.syn()
+
+
+def make_drag(spec, touchpad, scale, invert):
+    if spec in (None, "none"):
+        return None
+    if spec == "spaces":
+        # GNOME swipes are "natural" (content follows the fingers), so by default the
+        # fingers move against the mouse: drag right -> next workspace. Up -> overview.
+        return TouchpadDrag(touchpad, 3, scale if invert else -scale, scale)
+    if spec == "navigate":
+        # Grab the page: content follows the mouse; sideways swipes go back/forward.
+        return TouchpadDrag(touchpad, 2, scale, scale)
+    raise ValueError(f"unknown drag effect {spec!r}")
+
+
+class StepScroll:
+    """Calls up()/down() once per wheel notch while the button is held."""
+
+    def __init__(self, up, down, begin=None, end=None):
+        self.up, self.down = up, down
+        self.on_begin, self.on_end = begin, end
+
+    def begin(self):
+        self.acc = 0
+        self.stepped = False
+
+    def wheel(self, v120):
+        self.acc += v120
+        while abs(self.acc) >= 120:
+            if not self.stepped and self.on_begin:
+                self.on_begin()
+            self.stepped = True
+            (self.up if self.acc > 0 else self.down)()
+            self.acc -= 120 if self.acc > 0 else -120
+
+    def end(self):
+        if self.stepped and self.on_end:
+            self.on_end()
+
+
+class ModifierScroll:
+    """Holds keys while passing the wheel through unsmoothed (ctrl -> zoom)."""
+
+    def __init__(self, kbd, keys, emit, scroller):
+        self.kbd, self.keys, self.emit = kbd, keys, emit
+        self.scroller = scroller
+
+    def begin(self):
+        self.scroller.stop()  # a glide still running would scroll with the keys held
+        for k in self.keys:
+            self.kbd.write(e.EV_KEY, k, 1)
+        self.kbd.syn()
+
+    def wheel(self, v120):
+        self.emit(v120)
+
+    def end(self):
+        for k in reversed(self.keys):
+            self.kbd.write(e.EV_KEY, k, 0)
+        self.kbd.syn()
+
+
+class DesktopAndApps:
+    """Wheel up opens the app grid, down shows the desktop; the reverse undoes it."""
+
+    def __init__(self, kbd):
+        self.grid = lambda: press_keys(kbd, parse_keys("super+a"))
+        self.desktop = lambda: press_keys(kbd, parse_keys("super+d"))
+
+    def begin(self):
+        self.acc = 0
+        self.state = None  # "grid" or "desktop" once something is shown
+
+    def wheel(self, v120):
+        self.acc += v120
+        if self.acc >= 120:
+            self.acc = 0
+            if self.state == "desktop":
+                self.desktop()
+                self.state = None
+            elif self.state is None:
+                self.grid()
+                self.state = "grid"
+        elif self.acc <= -120:
+            self.acc = 0
+            if self.state == "grid":
+                self.grid()
+                self.state = None
+            elif self.state is None:
+                self.desktop()
+                self.state = "desktop"
+
+    def end(self):
+        pass
+
+
+class SpeedScroll:
+    """Scrolls through the smooth scroller at a fixed speed (precise / swift)."""
+
+    def __init__(self, scroller, factor):
+        self.scroller, self.factor = scroller, factor
+
+    def begin(self):
+        pass
+
+    def wheel(self, v120):
+        self.scroller.wheel(v120, self.factor)
+
+    def end(self):
+        pass
+
+
+def make_scroll(spec, kbd, mouse, scroller):
+    if spec in (None, "none"):
+        return None
+    tap = lambda keys: (lambda: press_keys(kbd, parse_keys(keys)))
+    if spec == "zoom":
+        return ModifierScroll(kbd, [e.KEY_LEFTCTRL], hires_emitter(mouse), scroller)
+    if spec == "app-switcher":
+        # Like holding Super and pressing Tab; Super goes down only on the first
+        # notch, since Super pressed and released alone opens the overview.
+        def hold(value):
+            kbd.write(e.EV_KEY, e.KEY_LEFTMETA, value)
+            kbd.syn()
+        return StepScroll(tap("shift+tab"), tap("tab"), begin=lambda: hold(1),
+                          end=lambda: hold(0))
+    if spec == "spaces":
+        return StepScroll(tap(SHORTCUTS["workspace-left"]), tap(SHORTCUTS["workspace-right"]))
+    if spec == "desktop-and-apps":
+        return DesktopAndApps(kbd)
+    if spec == "precise":
+        return SpeedScroll(scroller, 0.25)
+    if spec == "swift":
+        return SpeedScroll(scroller, 4.0)
+    raise ValueError(f"unknown scroll effect {spec!r}")
+
+
+class Binding:
+    def __init__(self, click=None, double=None, hold=None, drag=None, scroll=None):
+        self.click, self.double, self.hold = click, double, hold
+        self.drag, self.scroll = drag, scroll
+
+
+class Press:
+    def __init__(self, code, binding, start, second):
+        self.code, self.binding, self.start, self.second = code, binding, start, second
+        self.travel = 0
+        self.mode = None  # "drag", "scroll" or "hold" once the press becomes one
+
+
+class Buttons:
+    """Per-button click / double click / hold / drag / scroll state machine.
+
+    Pure logic: effects are callables or objects from the make_* factories.
+    """
+
+    def __init__(self, bindings, clock=time.monotonic):
+        self.bindings = bindings  # {button code: Binding}
+        self.clock = clock
+        self.active = None        # Press of the button currently held
+        self.swallowed = set()    # buttons pressed while another one was active
+        self.pending = None       # (code, due): single click waiting for a double
+
+    def button(self, code, value):
+        """Returns True if the event was consumed."""
+        if code not in self.bindings:
+            return False
+        if value == 2:
+            return True
+        if value == 1:
+            if self.active is not None:
+                self.swallowed.add(code)
+                return True
+            second = self.pending is not None and self.pending[0] == code
+            if self.pending is not None and not second:
+                self._fire_pending()
+            self.pending = None
+            self.active = Press(code, self.bindings[code], self.clock(), second)
+            return True
+        if code in self.swallowed:
+            self.swallowed.discard(code)
+            return True
+        press = self.active
+        if press is None or press.code != code:
+            return True
+        self.active = None
+        b = press.binding
+        if press.mode == "drag":
+            b.drag.end()
+        elif press.mode == "scroll":
+            b.scroll.end()
+        elif press.mode == "hold":
+            pass
+        elif press.second and b.double:
+            b.double()
+        elif b.double:
+            self.pending = (code, self.clock() + DOUBLE_CLICK_WINDOW)
+        elif b.click:
+            b.click()
+        return True
+
+    def motion(self, dx, dy):
+        """Returns True if the motion was consumed (pointer frozen)."""
+        press = self.active
+        if press is None:
+            return False
+        press.travel += abs(dx) + abs(dy)
+        if press.mode is None and press.travel > CLICK_SLOP and press.binding.drag:
+            press.binding.drag.begin()
+            press.mode = "drag"
+        if press.mode == "drag":
+            press.binding.drag.move(dx, dy)
+            return True
+        return False
+
+    def wheel(self, v120):
+        """Returns True if the wheel event was consumed."""
+        press = self.active
+        if press is None or not press.binding.scroll or press.mode not in (None, "scroll"):
+            return False
+        if press.mode is None:
+            press.binding.scroll.begin()
+            press.mode = "scroll"
+        press.binding.scroll.wheel(v120)
+        return True
+
+    def frame(self):
+        if self.active is not None and self.active.mode == "drag":
+            self.active.binding.drag.frame()
+
+    def _hold_due(self):
+        press = self.active
+        if (press is None or press.mode is not None or not press.binding.hold
+                or press.travel > CLICK_SLOP):
+            return None
+        return press.start + HOLD_TIME
+
+    def timeout(self):
+        dues = [d for d in (self.pending and self.pending[1], self._hold_due()) if d]
+        return max(0.0, min(dues) - self.clock()) if dues else None
+
+    def tick(self):
+        now = self.clock()
+        if self.pending is not None and now >= self.pending[1]:
+            self._fire_pending()
+        due = self._hold_due()
+        if due is not None and now >= due:
+            self.active.mode = "hold"
+            self.active.binding.hold()
+
+    def _fire_pending(self):
+        code, _ = self.pending
+        self.pending = None
+        if self.bindings[code].click:
+            self.bindings[code].click()
+
+
+def find_mouse(name_filter):
+    for path in evdev.list_devices():
+        dev = evdev.InputDevice(path)
+        caps = dev.capabilities()
+        if (dev.name.startswith(NAME_PREFIX) or dev.name.startswith("wheel-drag-workspaces")
+                or e.BTN_MIDDLE not in caps.get(e.EV_KEY, [])
+                or e.REL_X not in caps.get(e.EV_REL, [])
+                or (name_filter and name_filter.lower() not in dev.name.lower())):
+            dev.close()
+            continue
+        return dev
+    return None
+
+
+def native_click(mouse, code):
+    def click():
+        for value in (1, 0):
+            mouse.write(e.EV_KEY, code, value)
+            mouse.syn()
+    return click
+
+
+def build_bindings(config, kbd, mouse, touchpad, scroller):
+    drag_cfg = config["drag"]
+    bindings = {}
+    for name, spec in config["buttons"].items():
+        code = BUTTONS[name]
+        click = make_action(spec["click"], kbd, mouse) if "click" in spec else native_click(mouse, code)
+        bindings[code] = Binding(
+            click=click,
+            double=make_action(spec.get("double-click"), kbd, mouse),
+            hold=make_action(spec.get("hold"), kbd, mouse),
+            drag=make_drag(spec.get("drag"), touchpad, drag_cfg["scale"], drag_cfg["invert"]),
+            scroll=make_scroll(spec.get("scroll"), kbd, mouse, scroller),
+        )
+    return bindings
+
+
+class Settings:
+    """The settings file, re-read whenever its modification time changes."""
+
+    def __init__(self, path):
+        self.path = path
+        self.stamp = None
+        self.config = DEFAULTS
+
+    def reload(self):
+        """Returns True when different, valid settings were loaded."""
+        try:
+            stamp = os.stat(self.path).st_mtime_ns
+        except FileNotFoundError:
+            stamp = None
+        if stamp == self.stamp:
+            return False
+        self.stamp = stamp
+        if stamp is None:
+            log.info("No %s, using defaults", self.path)
+            self.config = DEFAULTS
+            return True
+        try:
+            config = load_config(self.path)
+        except (OSError, ValueError) as err:
+            log.error("Ignoring invalid %s: %s", self.path, err)
+            return False
+        self.config = config
+        return True
+
+
+class Session:
+    """The scroll and button handling built from one version of the settings."""
+
+    def __init__(self, config, kbd, mouse, touchpad, scroll_pad):
+        scroll = config["scroll"]
+        if scroll["smooth"] == "off":
+            self.pad_scroll = None
+            wheel = hires_emitter(mouse)
+            emit = (lambda v: wheel(-v)) if scroll["reverse"] else wheel
+            on_stop = None
+        else:
+            self.pad_scroll = TouchpadScroll(scroll_pad, scroll["reverse"])
+            emit, on_stop = self.pad_scroll.emit, self.pad_scroll.stop
+        self.scroller = SmoothScroller(emit, scroll["smooth"], scroll["speed"],
+                                       scroll["acceleration"], on_stop=on_stop)
+        self.buttons = Buttons(build_bindings(config, kbd, mouse, touchpad, self.scroller))
+        self.parts = [p for p in (self.buttons, self.scroller, self.pad_scroll) if p]
+
+    def timeout(self):
+        timeouts = [t for t in (p.timeout() for p in self.parts) if t is not None]
+        return min(timeouts) if timeouts else None
+
+    def tick(self):
+        for part in self.parts:
+            part.tick()
+
+    def close(self):
+        if self.pad_scroll:
+            self.pad_scroll.stop()
+
+
+def run(settings, device_filter):
+    kbd = evdev.UInput({e.EV_KEY: list(range(e.KEY_ESC, e.KEY_MICMUTE + 1))},
+                       name=f"{NAME_PREFIX} keyboard")
+    touchpad = VirtualTouchpad("touchpad")
+    scroll_pad = VirtualTouchpad("scroll touchpad")
+    waiting_logged = False
+    while True:
+        settings.reload()
+        if not settings.config["enabled"]:
+            time.sleep(1)
+            continue
+        dev = find_mouse(device_filter)
+        if dev is None:
+            if not waiting_logged:
+                log.info("No mouse found, waiting for one to be plugged in")
+                waiting_logged = True
+            time.sleep(2)
+            continue
+        waiting_logged = False
+        log.info("Using %s (%s)", dev.name, dev.path)
+        hires = e.REL_WHEEL_HI_RES in dev.capabilities().get(e.EV_REL, [])
+        try:
+            with evdev.UInput.from_device(dev, name=f"{NAME_PREFIX} mouse") as mouse:
+                session = Session(settings.config, kbd, mouse, touchpad, scroll_pad)
+                dev.grab()
+                next_check = time.monotonic() + 1
+                while True:
+                    timeout = min(t for t in (session.timeout(),
+                                              next_check - time.monotonic()) if t is not None)
+                    readable, _, _ = select.select([dev.fd], [], [], max(0.0, timeout))
+                    if readable:
+                        for ev in dev.read():
+                            handle(ev, session.buttons, session.scroller, mouse, hires)
+                    session.tick()
+                    if time.monotonic() < next_check:
+                        continue
+                    next_check = time.monotonic() + 1
+                    # Swap settings only between presses, never in the middle of one.
+                    if session.buttons.active is None and settings.reload():
+                        session.close()
+                        if not settings.config["enabled"]:
+                            log.info("Disabled, releasing the mouse")
+                            break
+                        session = Session(settings.config, kbd, mouse, touchpad, scroll_pad)
+                        log.info("Settings reloaded")
+        except OSError as err:
+            log.warning("Lost %s: %s", dev.name, err)
+        finally:
+            dev.close()  # also releases the grab
+        time.sleep(1)
+
+
+def handle(ev, buttons, scroller, mouse, hires):
+    if ev.type == e.EV_KEY and buttons.button(ev.code, ev.value):
+        return
+    if ev.type == e.EV_REL:
+        if ev.code in (e.REL_X, e.REL_Y):
+            dx = ev.value if ev.code == e.REL_X else 0
+            dy = ev.value if ev.code == e.REL_Y else 0
+            if buttons.motion(dx, dy):
+                return
+        elif ev.code in (e.REL_WHEEL, e.REL_WHEEL_HI_RES):
+            if (ev.code == e.REL_WHEEL) == hires:
+                return  # use one of the pair; the scroller re-creates the other
+            v120 = ev.value if hires else ev.value * 120
+            if not buttons.wheel(v120):
+                scroller.wheel(v120)
+            return
+    if ev.type == e.EV_SYN:
+        buttons.frame()
+    mouse.write(ev.type, ev.code, ev.value)
+
+
+def main():
+    parser = argparse.ArgumentParser(description=__doc__.splitlines()[0])
+    parser.add_argument("--config", default=f"/etc/{NAME_PREFIX}.toml",
+                        help="settings file (default /etc/%(prog)s.toml)")
+    parser.add_argument("--device", help="only use a mouse whose name contains this text")
+    parser.add_argument("--check", action="store_true",
+                        help="validate the settings file and exit")
+    args = parser.parse_args()
+    logging.basicConfig(level=logging.INFO, format="%(levelname)s %(message)s")
+    if args.check:
+        load_config(args.config)
+        print("settings OK")
+        return
+    run(Settings(args.config), args.device)
+
+
+def load_config(path):
+    with open(path, "rb") as f:
+        config = merge(DEFAULTS, tomllib.load(f))
+    validate(config)
+    return config
+
+
+def validate(config):
+    """Reject typos in the settings file up front, not on first use."""
+    def check(ok, message):
+        if not ok:
+            raise ValueError(message)
+
+    scroll, drag = config["scroll"], config["drag"]
+    check(isinstance(config["enabled"], bool), "enabled must be true or false")
+    check(scroll["smooth"] in ("off", *SmoothScroller.TAU),
+          "scroll.smooth must be off, regular or high")
+    check(scroll["speed"] in SmoothScroller.SPEED, "scroll.speed must be low, medium or high")
+    for key in ("acceleration", "reverse"):
+        check(isinstance(scroll[key], bool), f"scroll.{key} must be true or false")
+    check(isinstance(drag["scale"], (int, float)) and 0 < drag["scale"] <= 10,
+          "drag.scale must be a number between 0 and 10")
+    check(isinstance(drag["invert"], bool), "drag.invert must be true or false")
+    for name, spec in config["buttons"].items():
+        check(name in BUTTONS, f"unknown button {name!r}, expected one of {', '.join(BUTTONS)}")
+        check(isinstance(spec, dict), f"buttons.{name} must be a table")
+        for trigger in ("click", "double-click", "hold"):
+            action = spec.get(trigger, "none")
+            check(isinstance(action, str), f"buttons.{name}.{trigger} must be text")
+            if action != "none" and action not in CLICKS:
+                parse_keys(SHORTCUTS.get(action, action))
+        check(spec.get("drag", "none") in DRAG_EFFECTS,
+              f"buttons.{name}.drag: unknown effect {spec.get('drag')!r}")
+        check(spec.get("scroll", "none") in SCROLL_EFFECTS,
+              f"buttons.{name}.scroll: unknown effect {spec.get('scroll')!r}")
+
+
+if __name__ == "__main__":
+    main()

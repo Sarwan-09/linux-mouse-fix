@@ -1,0 +1,428 @@
+#!/usr/bin/env python3
+"""Settings window for linux-mouse-fix.
+
+Edits ~/.config/linux-mouse-fix/config.toml; the service notices the change and
+applies it within a second, so nothing here needs root.
+"""
+import importlib.machinery
+import importlib.util
+import json
+import os
+import subprocess
+import sys
+import tomllib
+from pathlib import Path
+
+import gi
+
+gi.require_version("Gtk", "4.0")
+gi.require_version("Adw", "1")
+from gi.repository import Adw, Gdk, GLib, Gtk  # noqa: E402
+
+APP_ID = "local.LinuxMouseFix"
+SERVICE = "linux-mouse-fix"
+DAEMON = os.environ.get("LMF_DAEMON", "/usr/local/bin/linux-mouse-fix")
+CONFIG = Path(GLib.get_user_config_dir()) / "linux-mouse-fix" / "config.toml"
+
+
+def load_daemon():
+    """The service's own module, for its defaults, option names and validation."""
+    loader = importlib.machinery.SourceFileLoader("linux_mouse_fix", DAEMON)
+    spec = importlib.util.spec_from_loader("linux_mouse_fix", loader)
+    module = importlib.util.module_from_spec(spec)
+    loader.exec_module(module)
+    return module
+
+
+lmf = load_daemon()
+
+ACTIONS = [
+    ("none", "Nothing"),
+    ("middle-click", "Middle click"),
+    ("primary-click", "Left click"),
+    ("secondary-click", "Right click"),
+    ("back", "Back"),
+    ("forward", "Forward"),
+    ("overview", "Overview (all windows)"),
+    ("app-grid", "App grid"),
+    ("show-desktop", "Show desktop"),
+    ("workspace-left", "Workspace to the left"),
+    ("workspace-right", "Workspace to the right"),
+]
+DRAGS = [
+    ("none", "Nothing (move the pointer)"),
+    ("spaces", "Workspaces and overview"),
+    ("navigate", "Scroll and navigate"),
+]
+SCROLLS = [
+    ("none", "Scroll normally"),
+    ("zoom", "Zoom in or out"),
+    ("app-switcher", "Switch apps"),
+    ("spaces", "Switch workspaces"),
+    ("desktop-and-apps", "App grid and desktop"),
+    ("precise", "Precise scroll (slow)"),
+    ("swift", "Swift scroll (fast)"),
+]
+BUTTONS = [
+    ("middle", "Wheel press", "Pressing down on the scroll wheel"),
+    ("front", "Front side button", "The side button closer to the front of the mouse"),
+    ("back", "Back side button", "The side button closer to your palm"),
+]
+TRIGGERS = [
+    ("click", "Click", ACTIONS),
+    ("double-click", "Double click", ACTIONS),
+    ("hold", "Hold", ACTIONS),
+    ("drag", "Hold and drag", DRAGS),
+    ("scroll", "Hold and scroll", SCROLLS),
+]
+NATIVE_CLICK = {"middle": "middle-click", "front": "forward", "back": "back"}
+CUSTOM = "\0custom"  # combo entry that opens the shortcut recorder
+MODIFIER_KEYS = {"leftctrl", "rightctrl", "leftshift", "rightshift", "leftalt",
+                 "rightalt", "leftmeta", "rightmeta", "capslock"}
+
+
+KEYVAL_NAMES = {"page_up": "pageup", "prior": "pageup", "page_down": "pagedown",
+                "next": "pagedown", "return": "enter", "escape": "esc", "print": "sysrq"}
+
+
+def key_name(keyval, keycode):
+    """The evdev-style key name for a key press, e.g. 't', 'pageup', 'f5'."""
+    gdk_name = (Gdk.keyval_name(Gdk.keyval_to_lower(keyval)) or "").lower()
+    if gdk_name.split("_")[0] in ("control", "shift", "alt", "super", "meta", "hyper", "iso"):
+        return "leftctrl"  # a modifier on its own; the caller waits for a real key
+    name = KEYVAL_NAMES.get(gdk_name, gdk_name)
+    if f"KEY_{name.upper()}" in lmf.e.ecodes:
+        return name
+    # Symbols and non-Latin layouts: fall back to the physical key
+    # (XKB keycodes are evdev codes + 8).
+    name = lmf.e.KEY.get(keycode - 8)
+    if isinstance(name, list):
+        name = name[0]
+    return name.removeprefix("KEY_").lower() if name else None
+
+
+def pretty_keys(spec):
+    return "+".join(part.capitalize() for part in spec.split("+"))
+
+
+def dump_toml(config):
+    def value(v):
+        if isinstance(v, bool):
+            return "true" if v else "false"
+        if isinstance(v, float):
+            return repr(round(v, 2))
+        if isinstance(v, int):
+            return str(v)
+        return json.dumps(v)  # a TOML basic string for anything we write
+
+    def table(name, items):
+        return [f"[{name}]"] + [f"{k} = {value(v)}" for k, v in items.items()] + [""]
+
+    lines = ["# Written by the Mouse Fix settings app; see /usr/local/bin/linux-mouse-fix.",
+             f"enabled = {value(config['enabled'])}", ""]
+    lines += table("scroll", config["scroll"])
+    lines += table("drag", config["drag"])
+    for name, spec in config["buttons"].items():
+        lines += table(f"buttons.{name}", spec)
+    return "\n".join(lines)
+
+
+def read_config():
+    """Current settings merged over the defaults, plus an error message if unreadable."""
+    try:
+        return lmf.load_config(CONFIG), None
+    except FileNotFoundError:
+        return lmf.merge(lmf.DEFAULTS, {}), None
+    except (OSError, ValueError) as err:
+        return lmf.merge(lmf.DEFAULTS, {}), f"Settings file had a problem, showing defaults: {err}"
+
+
+class OptionRow(Adw.ComboRow):
+    """A combo row over (value, label) pairs that can also hold a custom shortcut."""
+
+    def __init__(self, title, options, value, on_change, allow_custom=False):
+        super().__init__(title=title)
+        self.options = options
+        self.on_change = on_change
+        self.allow_custom = allow_custom
+        self.value = value
+        self.rebuild()
+        self.connect("notify::selected", self.selected_changed)
+
+    def rebuild(self):
+        self.values = [v for v, _ in self.options]
+        labels = [label for _, label in self.options]
+        if self.value not in self.values:
+            self.values.append(self.value)
+            labels.append(f"Shortcut: {pretty_keys(self.value)}")
+        if self.allow_custom:
+            self.values.append(CUSTOM)
+            labels.append("Keyboard shortcut…")
+        self.updating = True
+        self.set_model(Gtk.StringList.new(labels))
+        self.set_selected(self.values.index(self.value))
+        self.updating = False
+
+    def set_value(self, value):
+        self.value = value
+        self.rebuild()
+
+    def selected_changed(self, *_):
+        if self.updating:
+            return
+        chosen = self.values[self.get_selected()]
+        if chosen == CUSTOM:
+            ShortcutDialog(self, self.custom_chosen).present(self.get_root())
+            return
+        self.value = chosen
+        self.on_change(chosen)
+
+    def custom_chosen(self, keys):
+        if keys is None:  # cancelled: back to what it was
+            self.rebuild()
+            return
+        self.set_value(keys)
+        self.on_change(keys)
+
+
+class ShortcutDialog(Adw.AlertDialog):
+    """Records a key combo by having the user press it."""
+
+    def __init__(self, row, done):
+        super().__init__(heading="Keyboard shortcut",
+                         body="Press the keys you want this button to send.")
+        self.done = done
+        self.keys = None
+        self.label = Gtk.Label(label="Waiting for keys…", css_classes=["title-2"],
+                               margin_top=12, margin_bottom=12)
+        self.set_extra_child(self.label)
+        self.add_response("cancel", "Cancel")
+        self.add_response("save", "Use Shortcut")
+        self.set_response_appearance("save", Adw.ResponseAppearance.SUGGESTED)
+        self.set_response_enabled("save", False)
+        self.set_close_response("cancel")
+        keys = Gtk.EventControllerKey(propagation_phase=Gtk.PropagationPhase.CAPTURE)
+        keys.connect("key-pressed", self.key_pressed)
+        self.add_controller(keys)
+        self.connect("response", self.responded)
+
+    def key_pressed(self, _controller, keyval, keycode, state):
+        name = key_name(keyval, keycode)
+        if not name:
+            return False
+        mods = [m for m, mask in (("super", Gdk.ModifierType.SUPER_MASK),
+                                  ("ctrl", Gdk.ModifierType.CONTROL_MASK),
+                                  ("alt", Gdk.ModifierType.ALT_MASK),
+                                  ("shift", Gdk.ModifierType.SHIFT_MASK)) if state & mask]
+        if name in MODIFIER_KEYS:
+            return True
+        if name == "esc" and not mods:
+            return False  # let Escape close the dialog
+        self.keys = "+".join(mods + [name])
+        self.label.set_label(pretty_keys(self.keys))
+        self.set_response_enabled("save", True)
+        return True
+
+    def responded(self, _dialog, response):
+        self.done(self.keys if response == "save" else None)
+
+
+class Window(Adw.ApplicationWindow):
+    def __init__(self, app):
+        super().__init__(application=app, title="Mouse Fix", default_width=600,
+                         default_height=760)
+        self.config, problem = read_config()
+        self.save_source = None
+
+        self.toasts = Adw.ToastOverlay()
+        stack = Adw.ViewStack()
+        stack.add_titled_with_icon(self.general_page(), "general", "General",
+                                   "emblem-system-symbolic")
+        stack.add_titled_with_icon(self.scroll_page(), "scrolling", "Scrolling",
+                                   "view-continuous-symbolic")
+        stack.add_titled_with_icon(self.buttons_page(), "buttons", "Buttons",
+                                   "input-mouse-symbolic")
+
+        self.banner = Adw.Banner(title="The mouse service isn't running, so these settings "
+                                       "have no effect", button_label="Start")
+        self.banner.connect("button-clicked", self.start_service)
+        box = Gtk.Box(orientation=Gtk.Orientation.VERTICAL)
+        box.append(self.banner)
+        stack.set_vexpand(True)
+        box.append(stack)
+        self.toasts.set_child(box)
+
+        header = Adw.HeaderBar()
+        switcher = Adw.ViewSwitcher(stack=stack, policy=Adw.ViewSwitcherPolicy.WIDE)
+        header.set_title_widget(switcher)
+        bottom = Adw.ViewSwitcherBar(stack=stack)
+        view = Adw.ToolbarView(content=self.toasts)
+        view.add_top_bar(header)
+        view.add_bottom_bar(bottom)
+        breakpoint = Adw.Breakpoint.new(Adw.BreakpointCondition.parse("max-width: 500sp"))
+        breakpoint.add_setter(bottom, "reveal", True)
+        breakpoint.add_setter(switcher, "visible", False)
+        self.add_breakpoint(breakpoint)
+        self.set_content(view)
+
+        if problem:
+            self.toast(problem)
+        self.check_service()
+        GLib.timeout_add_seconds(3, self.check_service)
+
+    # pages ---------------------------------------------------------------
+
+    def general_page(self):
+        page = Adw.PreferencesPage()
+        main = Adw.PreferencesGroup(
+            description="Mac Mouse Fix-style smooth scrolling and button gestures. "
+                        "Changes apply right away.")
+        self.enabled_row = self.switch_row(
+            main, "Enabled", "Turn off to use the mouse exactly as normal",
+            lambda: self.config["enabled"], lambda v: self.config.update(enabled=v))
+        page.add(main)
+
+        drag = Adw.PreferencesGroup(
+            title="Dragging",
+            description="Applies to buttons set to “Workspaces and overview” or "
+                        "“Scroll and navigate” when held and dragged")
+        sensitivity = Adw.SpinRow.new_with_range(0.3, 5.0, 0.1)
+        sensitivity.set_title("Drag sensitivity")
+        sensitivity.set_subtitle("Higher moves further for the same hand movement")
+        sensitivity.set_digits(1)
+        sensitivity.set_value(self.config["drag"]["scale"])
+        sensitivity.connect("notify::value", lambda row, _: self.change(
+            lambda: self.config["drag"].update(scale=round(row.get_value(), 1))))
+        drag.add(sensitivity)
+        self.switch_row(drag, "Drag left for the next workspace",
+                        "Off: drag right for the next workspace",
+                        lambda: self.config["drag"]["invert"],
+                        lambda v: self.config["drag"].update(invert=v))
+        page.add(drag)
+
+        other = Adw.PreferencesGroup()
+        reset = Adw.ButtonRow(title="Restore Defaults")
+        reset.add_css_class("destructive-action")
+        reset.connect("activated", self.confirm_reset)
+        other.add(reset)
+        page.add(other)
+        return page
+
+    def scroll_page(self):
+        page = Adw.PreferencesPage()
+        group = Adw.PreferencesGroup(
+            title="Scrolling",
+            description="Shift + scroll scrolls sideways and Ctrl + scroll zooms; "
+                        "Linux does both by itself.")
+        scroll = self.config["scroll"]
+        group.add(OptionRow("Smoothness",
+                            [("off", "Off"), ("regular", "Regular"), ("high", "High")],
+                            scroll["smooth"], lambda v: self.change(lambda: scroll.update(smooth=v))))
+        group.add(OptionRow("Speed", [("low", "Low"), ("medium", "Medium"), ("high", "High")],
+                            scroll["speed"], lambda v: self.change(lambda: scroll.update(speed=v))))
+        self.switch_row(group, "Acceleration", "Spin the wheel quickly to scroll further",
+                        lambda: scroll["acceleration"],
+                        lambda v: scroll.update(acceleration=v))
+        self.switch_row(group, "Reverse direction",
+                        "Flip scrolling if it goes the wrong way",
+                        lambda: scroll["reverse"], lambda v: scroll.update(reverse=v))
+        page.add(group)
+        return page
+
+    def buttons_page(self):
+        page = Adw.PreferencesPage()
+        self.button_rows = {}
+        for name, title, description in BUTTONS:
+            group = Adw.PreferencesGroup(title=title, description=description)
+            for trigger, label, options in TRIGGERS:
+                row = OptionRow(label, options, self.button_value(name, trigger),
+                                lambda v, n=name, t=trigger: self.set_button(n, t, v),
+                                allow_custom=options is ACTIONS)
+                if trigger == "double-click":
+                    row.set_subtitle("Makes a single click wait a moment")
+                self.button_rows[name, trigger] = row
+                group.add(row)
+            page.add(group)
+        return page
+
+    # helpers -------------------------------------------------------------
+
+    def switch_row(self, group, title, subtitle, get, put):
+        row = Adw.SwitchRow(title=title, subtitle=subtitle, active=get())
+        row.connect("notify::active", lambda r, _: self.change(lambda: put(r.get_active())))
+        group.add(row)
+        return row
+
+    def button_value(self, name, trigger):
+        spec = self.config["buttons"].get(name, {})
+        if trigger == "click":
+            return spec.get("click", NATIVE_CLICK[name])
+        return spec.get(trigger, "none")
+
+    def set_button(self, name, trigger, value):
+        self.change(lambda: self.config["buttons"].setdefault(name, {}).update({trigger: value}))
+
+    def change(self, apply):
+        apply()
+        if self.save_source:
+            GLib.source_remove(self.save_source)
+        self.save_source = GLib.timeout_add(300, self.save)
+
+    def save(self):
+        self.save_source = None
+        try:
+            lmf.validate(self.config)
+            CONFIG.parent.mkdir(parents=True, exist_ok=True)
+            tmp = CONFIG.with_suffix(".tmp")
+            tmp.write_text(dump_toml(self.config))
+            tmp.replace(CONFIG)
+        except (OSError, ValueError) as err:
+            self.toast(f"Couldn't save: {err}")
+            return False
+        self.toast("Saved")
+        return False
+
+    def toast(self, text):
+        toast = Adw.Toast(title=text, timeout=2)
+        self.toasts.add_toast(toast)
+
+    def confirm_reset(self, *_):
+        dialog = Adw.AlertDialog(heading="Restore defaults?",
+                                 body="All buttons and scrolling go back to the "
+                                      "Mac Mouse Fix-style defaults.")
+        dialog.add_response("cancel", "Cancel")
+        dialog.add_response("reset", "Restore")
+        dialog.set_response_appearance("reset", Adw.ResponseAppearance.DESTRUCTIVE)
+        dialog.connect("response", lambda _d, r: r == "reset" and self.reset())
+        dialog.present(self)
+
+    def reset(self):
+        self.config = lmf.merge(lmf.DEFAULTS, {})
+        self.save()
+        self.get_application().reopen(self)
+
+    def check_service(self):
+        active = subprocess.run(["systemctl", "is-active", "--quiet", SERVICE]).returncode == 0
+        self.banner.set_revealed(not active)
+        return True
+
+    def start_service(self, *_):
+        subprocess.Popen(["pkexec", "systemctl", "start", SERVICE])
+
+
+class App(Adw.Application):
+    def __init__(self):
+        super().__init__(application_id=APP_ID)
+
+    def do_activate(self):
+        window = self.get_active_window() or Window(self)
+        window.present()
+
+    def reopen(self, old):
+        """Rebuild the window so every row shows the restored values."""
+        Window(self).present()
+        old.destroy()
+
+
+if __name__ == "__main__":
+    sys.exit(App().run(sys.argv))

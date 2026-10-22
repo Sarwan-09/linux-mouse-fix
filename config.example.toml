@@ -1,0 +1,47 @@
+# linux-mouse-fix settings. Edit with the "Mouse Fix" app, or by hand: the service
+# re-reads this file within a second of any change.
+
+enabled = true         # false: leave the mouse completely alone
+
+[scroll]
+smooth = "high"        # off | regular | high
+speed = "medium"       # low | medium | high
+acceleration = true    # spinning the wheel fast scrolls further per notch
+reverse = false        # flip the scroll direction
+
+[drag]
+scale = 1.5            # how far a drag moves; higher = more sensitive
+invert = false         # true: drag left for the next workspace
+
+# Buttons: middle (wheel press), back, front (the two side buttons), button6..8.
+#
+# click / double-click / hold actions:
+#   middle-click, primary-click, secondary-click, back, forward,
+#   overview, app-grid, show-desktop, workspace-left, workspace-right,
+#   any key combo such as "ctrl+shift+t" or "super+e", or "none".
+#   A button with a double-click action sends its single click ~0.3 s late.
+#
+# drag (hold the button and move the mouse):
+#   spaces    three-finger swipe: left/right switches workspace, up opens the overview
+#   navigate  two-finger swipe: grab and scroll the page, sideways for back/forward
+#   none
+#
+# scroll (hold the button and turn the wheel):
+#   zoom, app-switcher, spaces, desktop-and-apps, precise, swift, none
+
+[buttons.middle]
+click = "middle-click"
+hold = "show-desktop"
+drag = "spaces"
+scroll = "app-switcher"
+
+[buttons.front]
+click = "middle-click"
+double-click = "overview"
+drag = "spaces"
+scroll = "zoom"
+
+[buttons.back]
+click = "back"
+drag = "navigate"
+scroll = "desktop-and-apps"

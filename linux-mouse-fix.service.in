@@ -1,0 +1,11 @@
+[Unit]
+Description=Mac Mouse Fix-style mouse features (smooth scrolling, button gestures)
+After=systemd-udev-settle.service
+
+[Service]
+ExecStart=/usr/bin/python3 /usr/local/bin/linux-mouse-fix --config @CONFIG@
+Restart=always
+RestartSec=2
+
+[Install]
+WantedBy=multi-user.target

@@ -1,0 +1,10 @@
+[Desktop Entry]
+Type=Application
+Name=Mouse Fix
+Comment=Smooth scrolling and mouse button gestures
+Exec=@BIN@/linux-mouse-fix-settings
+Icon=input-mouse
+Categories=Settings;HardwareSettings;
+Keywords=mouse;scroll;button;gesture;smooth;
+StartupNotify=true
+StartupWMClass=local.LinuxMouseFix
