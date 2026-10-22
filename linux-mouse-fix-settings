@@ -4,8 +4,7 @@
 Edits ~/.config/linux-mouse-fix/config.toml; the service notices the change and
 applies it within a second, so nothing here needs root.
 """
-import importlib.machinery
-import importlib.util
+import copy
 import json
 import os
 import subprocess
@@ -25,16 +24,30 @@ DAEMON = os.environ.get("LMF_DAEMON", "/usr/local/bin/linux-mouse-fix")
 CONFIG = Path(GLib.get_user_config_dir()) / "linux-mouse-fix" / "config.toml"
 
 
-def load_daemon():
-    """The service's own module, for its defaults, option names and validation."""
-    loader = importlib.machinery.SourceFileLoader("linux_mouse_fix", DAEMON)
-    spec = importlib.util.spec_from_loader("linux_mouse_fix", loader)
-    module = importlib.util.module_from_spec(spec)
-    loader.exec_module(module)
-    return module
+def run_daemon(*args):
+    """Asks the service binary, which owns the defaults, key names and validation."""
+    return subprocess.run([DAEMON, *args], capture_output=True, text=True)
 
 
-lmf = load_daemon()
+DEFAULTS = json.loads(run_daemon("--defaults").stdout)
+KEY_CODES = json.loads(run_daemon("--keys").stdout)  # key name -> evdev code
+KEY_NAMES = {code: name for name, code in KEY_CODES.items()}
+
+
+def merge(base, override):
+    out = copy.deepcopy(base)
+    for key, value in override.items():
+        if isinstance(value, dict) and isinstance(out.get(key), dict):
+            out[key] = merge(out[key], value)
+        else:
+            out[key] = value
+    return out
+
+
+def check(path):
+    """None if the settings file at `path` is valid, else the reason it isn't."""
+    result = run_daemon("--check", "--config", str(path))
+    return None if result.returncode == 0 else result.stderr.strip()
 
 ACTIONS = [
     ("none", "Nothing"),
@@ -91,14 +104,11 @@ def key_name(keyval, keycode):
     if gdk_name.split("_")[0] in ("control", "shift", "alt", "super", "meta", "hyper", "iso"):
         return "leftctrl"  # a modifier on its own; the caller waits for a real key
     name = KEYVAL_NAMES.get(gdk_name, gdk_name)
-    if f"KEY_{name.upper()}" in lmf.e.ecodes:
+    if name in KEY_CODES:
         return name
     # Symbols and non-Latin layouts: fall back to the physical key
     # (XKB keycodes are evdev codes + 8).
-    name = lmf.e.KEY.get(keycode - 8)
-    if isinstance(name, list):
-        name = name[0]
-    return name.removeprefix("KEY_").lower() if name else None
+    return KEY_NAMES.get(keycode - 8)
 
 
 def pretty_keys(spec):
@@ -118,7 +128,7 @@ def dump_toml(config):
     def table(name, items):
         return [f"[{name}]"] + [f"{k} = {value(v)}" for k, v in items.items()] + [""]
 
-    lines = ["# Written by the Mouse Fix settings app; see /usr/local/bin/linux-mouse-fix.",
+    lines = ["# Written by the Mouse Fix settings app.",
              f"enabled = {value(config['enabled'])}", ""]
     lines += table("scroll", config["scroll"])
     lines += table("drag", config["drag"])
@@ -130,11 +140,16 @@ def dump_toml(config):
 def read_config():
     """Current settings merged over the defaults, plus an error message if unreadable."""
     try:
-        return lmf.load_config(CONFIG), None
+        with open(CONFIG, "rb") as f:
+            config = merge(DEFAULTS, tomllib.load(f))
     except FileNotFoundError:
-        return lmf.merge(lmf.DEFAULTS, {}), None
+        return merge(DEFAULTS, {}), None
     except (OSError, ValueError) as err:
-        return lmf.merge(lmf.DEFAULTS, {}), f"Settings file had a problem, showing defaults: {err}"
+        return merge(DEFAULTS, {}), f"Settings file had a problem, showing defaults: {err}"
+    problem = check(CONFIG)
+    if problem:
+        return merge(DEFAULTS, {}), f"Settings file had a problem, showing defaults: {problem}"
+    return config, None
 
 
 class OptionRow(Adw.ComboRow):
@@ -370,13 +385,17 @@ class Window(Adw.ApplicationWindow):
 
     def save(self):
         self.save_source = None
+        tmp = CONFIG.with_suffix(".tmp")
         try:
-            lmf.validate(self.config)
             CONFIG.parent.mkdir(parents=True, exist_ok=True)
-            tmp = CONFIG.with_suffix(".tmp")
             tmp.write_text(dump_toml(self.config))
+            problem = check(tmp)
+            if problem:
+                tmp.unlink()
+                self.toast(f"Couldn't save: {problem}")
+                return False
             tmp.replace(CONFIG)
-        except (OSError, ValueError) as err:
+        except OSError as err:
             self.toast(f"Couldn't save: {err}")
             return False
         self.toast("Saved")
@@ -397,7 +416,7 @@ class Window(Adw.ApplicationWindow):
         dialog.present(self)
 
     def reset(self):
-        self.config = lmf.merge(lmf.DEFAULTS, {})
+        self.config = merge(DEFAULTS, {})
         self.save()
         self.get_application().reopen(self)
 

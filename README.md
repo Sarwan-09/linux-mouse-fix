@@ -32,11 +32,12 @@ independent project: it shares no code with Mac Mouse Fix and isn't affiliated w
 ## Requirements
 
 - GNOME on Wayland (tested on Ubuntu 26.04, GNOME 50)
-- Python 3.11 or newer
-- `python3-evdev`, plus `python3-gi`, `gir1.2-gtk-4.0` and `gir1.2-adw-1` for the settings app
+- Rust (`cargo`) to build the service
+- Python 3.11 or newer with `python3-gi`, `gir1.2-gtk-4.0` and `gir1.2-adw-1` for the
+  settings app
 
 ```sh
-sudo apt install python3-evdev python3-gi gir1.2-gtk-4.0 gir1.2-adw-1
+sudo apt install cargo python3-gi gir1.2-gtk-4.0 gir1.2-adw-1
 ```
 
 ## Install
@@ -51,7 +52,7 @@ Run `./uninstall.sh` to remove it. Your settings in `~/.config/linux-mouse-fix/`
 
 ## How it works
 
-`linux-mouse-fix` runs as a root system service. It grabs the mouse exclusively and
+`linux-mouse-fix` is a small Rust program (about 1 MB) that runs as a root system service. It grabs the mouse exclusively and
 forwards its events through a virtual mouse, changing them along the way. Scrolling
 and drags are sent to two virtual touchpads, so GNOME's own touchpad gestures do the
 animation. Shortcuts are sent through a virtual keyboard.
@@ -60,6 +61,19 @@ Settings are read from `~/.config/linux-mouse-fix/config.toml` (see
 `config.example.toml` for every option) and re-read whenever the file changes. Set
 `enabled = false` to hand the mouse back untouched.
 
+The settings app (Python, GTK 4 and libadwaita) never touches the mouse itself. It
+edits the settings file and asks the service for its defaults (`--defaults`), the
+key names shortcuts may use (`--keys`), and whether a file is valid (`--check`).
+
+| File | What it does |
+|---|---|
+| `src/main.rs` | Finds the mouse, creates the virtual devices, event loop, live settings reload |
+| `src/buttons.rs` | Click / double click / hold / drag / scroll gestures and their actions |
+| `src/scroll.rs` | Smooth, accelerated scrolling |
+| `src/touchpad.rs` | Virtual touchpad swipes and two-finger scrolling |
+| `src/config.rs` | Defaults, settings file parsing and validation |
+| `linux-mouse-fix-settings` | The settings app |
+
 Because GNOME sees virtual touchpads, a Touchpad section may appear in GNOME Settings.
 Touchpad scrolling follows GNOME's touchpad natural-scrolling setting. If scrolling
 goes the wrong way, turn on **Reverse direction** in the app.
@@ -67,11 +81,11 @@ goes the wrong way, turn on **Reverse direction** in the app.
 ## Tests
 
 ```sh
-tests/run_all.sh
+cargo test
 ```
 
 The tests drive the gesture logic, scrolling and settings handling with simulated
-input. They need no mouse, root or GNOME session.
+input and a fake clock. They need no mouse, root or GNOME session.
 
 ## License
 
